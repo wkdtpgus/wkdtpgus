@@ -1,0 +1,17 @@
+{
+  "zoorofile_version": "v0.0.0",
+  "animal": "hamster",
+  "github_username": "wkdtpgus",
+  "spotify_track_id": "원하는 곡 track id",
+  "timezone": "Asia/Seoul",
+  "language": "ko",
+  "features": {
+    "weekly_contributions": true,
+    "spotify": false
+  },
+  "commit_thresholds": {
+    "sleeping": 10,
+    "relaxed": 30,
+    "active": 60
+  }
+}
