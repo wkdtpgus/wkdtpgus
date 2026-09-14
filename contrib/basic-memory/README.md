@@ -39,7 +39,7 @@ git push -u origin feat/build-context-relation-filters
 
 ## 검증 결과 (원격 컨테이너, Python 3.13.7, SQLite)
 
-- 변경 영역 테스트: `tests/services/test_context_service.py`, `tests/mcp/test_tool_build_context.py`, `tests/api/v2/test_memory_router.py`, `tests/cli/test_cli_tool_json_output.py`, `tests/test_man_pages.py` 통과
+- 전체 단위 스위트 `tests/` 통과 (1893 passed, 2 skipped, 약 8분). `tests/mcp/test_tool_telemetry.py`는 span 속성 기대값에 새 파라미터 세 개를 추가해 맞췄습니다.
 - 새로 추가한 테스트: 서비스 6개, MCP 툴 2개, API 라우터 2개, CLI 3개
 - `ruff check src tests`, `ruff format`, `ty check` (변경 파일) 통과
 - 새로 추가된 코드 라인은 전부 커버됨 (미커버 라인은 기존 코드)
