@@ -1,0 +1,33 @@
+From 6b93d2730fc9df856613f85d4ca5f5e65d17d72d Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 14 Sep 2026 00:06:51 +0000
+Subject: [PATCH 1/2] docs(skills): inline wiki links create links_to
+ relations, not references
+
+The memory-notes skill told readers that a wiki link in prose creates a
+`references` relation. The parser (entity_parser.py, plugins.py) and
+NOTE-FORMAT.md both use `links_to`, and the `#bm:links_to` directive is
+named after it. Align the skill so agents filtering or writing relation
+types use the label that is actually indexed.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ skills/memory-notes/SKILL.md | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/skills/memory-notes/SKILL.md b/skills/memory-notes/SKILL.md
+index b0c3ce3..68f25b4 100644
+--- a/skills/memory-notes/SKILL.md
++++ b/skills/memory-notes/SKILL.md
+@@ -140,7 +140,7 @@ the team has more experience with REST. See [[API Specification]]
+ for the full contract.
+ ```
+ 
+-These create `references` relations automatically. Use the Relations section for explicit, typed relationships; use inline links for natural prose references.
++These create `links_to` relations automatically. Use the Relations section for explicit, typed relationships; use inline links for natural prose references.
+ 
+ ### Relation Tips
+ 
+-- 
+2.43.0
+

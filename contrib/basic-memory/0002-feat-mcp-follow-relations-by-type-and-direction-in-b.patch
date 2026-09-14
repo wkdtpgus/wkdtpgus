@@ -1,0 +1,1150 @@
+From 9733d06abb7151c8413e8c136d4efce4123fb02a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 14 Sep 2026 00:06:51 +0000
+Subject: [PATCH 2/2] feat(mcp): follow relations by type and direction in
+ build_context
+
+Relations already carry the type their author wrote
+(`- caused_by [[Outage]]`) and prose wiki links are indexed as implicit
+`links_to`, but the context traversal joined every edge alike. With
+`max_related` capping the result set and the cut made by `ORDER BY depth,
+type, id`, mentions and typed relations competed for the same budget and
+which ones survived was arbitrary.
+
+This adds three optional traversal filters, threaded from the MCP tool
+through the v2 API and MemoryClient down to ContextService.find_related:
+
+- `relation_types`: follow only edges whose type is in the list
+- `exclude_relation_types`: skip edges whose type is in the list
+  (`["links_to"]` keeps just the explicitly typed graph)
+- `direction`: `outgoing` (what the note declares), `incoming` (what
+  points at it), or `both` (default, unchanged behaviour)
+
+Filters apply at every hop of the recursive CTE, so
+`relation_types=["depends_on"]` at depth 2 returns transitive dependencies
+and nothing else. The primary lookup and pagination are untouched; with
+no filter the query is byte-identical to before. Type labels are bound
+as expanding parameters and match exactly as authored.
+
+`bm tool build-context` gains `--relation-type`, `--exclude-relation-type`
+(both repeatable) and `--direction`. The MCP tool also normalizes comma
+strings in the function body, because plain-function callers bypass the
+schema's BeforeValidator and a bare str would otherwise be sent as one
+query parameter per character.
+
+Regenerates the build-context(3) SYNOPSIS and documents the filters in
+the man page, the extended assistant guide and the CHANGELOG.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ CHANGELOG.md                                  |  13 ++
+ docs/ai-assistant-guide-extended.md           |   5 +-
+ .../api/v2/routers/memory_router.py           |  19 +++
+ src/basic_memory/cli/commands/tool.py         |  30 +++-
+ src/basic_memory/man/man3/build-context(3).md |  21 ++-
+ src/basic_memory/mcp/clients/memory.py        |  14 ++
+ src/basic_memory/mcp/tools/build_context.py   |  62 +++++++-
+ src/basic_memory/schemas/memory.py            |   4 +
+ src/basic_memory/services/context_service.py  | 108 +++++++++++++-
+ tests/api/v2/test_memory_router.py            |  68 +++++++++
+ tests/cli/test_cli_tool_json_output.py        |  62 ++++++++
+ tests/mcp/test_tool_build_context.py          | 138 ++++++++++++++++++
+ tests/services/test_context_service.py        | 115 +++++++++++++++
+ 13 files changed, 646 insertions(+), 13 deletions(-)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index e90d16b..3ba743e 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -4,6 +4,19 @@
+ 
+ ### Features
+ 
++- `build_context` can follow the graph by relation type and direction. Relations
++  already carry the type their author wrote (`- caused_by [[Outage]]`) and prose
++  wiki links are implicit `links_to`, but traversal treated every edge alike, so
++  mentions competed with typed relations for the same `max_related` budget.
++  `relation_types` follows only the listed types, `exclude_relation_types` skips
++  them (`["links_to"]` keeps just the explicitly typed graph), and `direction`
++  picks `outgoing`, `incoming`, or `both`. Filters apply at every hop, so
++  `relation_types=["depends_on"]` at `depth=2` returns transitive dependencies
++  and nothing else; the primary note is never filtered. The same parameters are
++  query parameters on `/v2/projects/{id}/memory/...` and options on
++  `bm tool build-context` (`--relation-type`, `--exclude-relation-type`,
++  `--direction`). No filter means the traversal is unchanged.
++
+ - **#610**: The manual's SYNOPSIS blocks are now generated from the tool registry.
+   `just man-regen` renders the MCP call on every section-3 page from the schema
+   clients actually receive (required parameters first, then defaults, in schema
+diff --git a/docs/ai-assistant-guide-extended.md b/docs/ai-assistant-guide-extended.md
+index bd507d7..b1c0d61 100644
+--- a/docs/ai-assistant-guide-extended.md
++++ b/docs/ai-assistant-guide-extended.md
+@@ -2894,7 +2894,7 @@ artifact = await view_note(
+ 
+ ### Knowledge Graph Navigation
+ 
+-**build_context(url, depth, timeframe, max_related, page, page_size, project)**
++**build_context(url, depth, timeframe, max_related, page, page_size, project, relation_types, exclude_relation_types, direction)**
+ - Navigate knowledge graph
+ - Parameters:
+   - `url` (required): memory:// URL
+@@ -2904,6 +2904,9 @@ artifact = await view_note(
+   - `page` (optional): Page number
+   - `page_size` (optional): Results per page
+   - `project` (required unless default_project_mode): Target project
++  - `relation_types` (optional): Only follow these relation types, e.g. `["depends_on", "caused_by"]`
++  - `exclude_relation_types` (optional): Skip these types; `["links_to"]` drops implicit prose mentions
++  - `direction` (optional): `"outgoing"`, `"incoming"`, or `"both"` (default)
+ - Returns: Root entity, related entities, paths
+ - Example:
+ ```python
+diff --git a/src/basic_memory/api/v2/routers/memory_router.py b/src/basic_memory/api/v2/routers/memory_router.py
+index aa662d9..0633c0e 100644
+--- a/src/basic_memory/api/v2/routers/memory_router.py
++++ b/src/basic_memory/api/v2/routers/memory_router.py
+@@ -23,6 +23,7 @@ from basic_memory.schemas.memory import (
+     GraphContext,
+     MAX_CONTEXT_PAGE_SIZE,
+     MAX_CONTEXT_RELATED_RESULTS,
++    RelationDirection,
+     normalize_memory_url,
+ )
+ from basic_memory.schemas.search import SearchItemType
+@@ -44,6 +45,9 @@ async def recent(
+     page: int = 1,
+     page_size: int = 10,
+     max_related: int = 10,
++    relation_types: Annotated[list[str] | None, Query()] = None,
++    exclude_relation_types: Annotated[list[str] | None, Query()] = None,
++    direction: RelationDirection = "both",
+ ) -> GraphContext:
+     """Get recent activity context for a project.
+ 
+@@ -57,6 +61,9 @@ async def recent(
+         page: Page number for pagination
+         page_size: Number of items per page
+         max_related: Maximum related entities to include per item
++        relation_types: Only follow relations with these types (repeatable)
++        exclude_relation_types: Skip relations with these types (repeatable)
++        direction: Follow "outgoing", "incoming", or "both" relation edges
+ 
+     Returns:
+         GraphContext with recent activity and related entities
+@@ -97,6 +104,9 @@ async def recent(
+                 limit=limit,
+                 offset=offset,
+                 max_related=max_related,
++                relation_types=relation_types,
++                exclude_relation_types=exclude_relation_types,
++                direction=direction,
+             )
+         with logfire.span(
+             "api.memory.recent_activity.shape_response",
+@@ -136,6 +146,9 @@ async def get_memory_context(
+         ge=0,
+         le=MAX_CONTEXT_RELATED_RESULTS,
+     ),
++    relation_types: Annotated[list[str] | None, Query()] = None,
++    exclude_relation_types: Annotated[list[str] | None, Query()] = None,
++    direction: RelationDirection = "both",
+ ) -> GraphContext:
+     """Get rich context from memory:// URI.
+ 
+@@ -153,6 +166,9 @@ async def get_memory_context(
+         page: Page number for pagination
+         page_size: Number of primary items per page
+         max_related: Maximum total related entities to include
++        relation_types: Only follow relations with these types (repeatable)
++        exclude_relation_types: Skip relations with these types (repeatable)
++        direction: Follow "outgoing", "incoming", or "both" relation edges
+ 
+     Returns:
+         GraphContext with the entity and its related context
+@@ -189,6 +205,9 @@ async def get_memory_context(
+                 limit=limit,
+                 offset=offset,
+                 max_related=max_related,
++                relation_types=relation_types,
++                exclude_relation_types=exclude_relation_types,
++                direction=direction,
+             )
+         with logfire.span(
+             "api.memory.build_context.shape_response",
+diff --git a/src/basic_memory/cli/commands/tool.py b/src/basic_memory/cli/commands/tool.py
+index 17d986c..594c2e8 100644
+--- a/src/basic_memory/cli/commands/tool.py
++++ b/src/basic_memory/cli/commands/tool.py
+@@ -21,7 +21,7 @@ Precedence, highest first: ``--json`` > ``--plain`` > non-TTY (JSON) > TTY
+ 
+ import json
+ import sys
+-from typing import Annotated, Any, Dict, List, Literal, Optional
++from typing import Annotated, Any, Dict, List, Literal, Optional, cast
+ 
+ import typer
+ from loguru import logger
+@@ -980,6 +980,23 @@ def build_context(
+     page: int = typer.Option(1, "--page", help="Page number for pagination"),
+     page_size: int = typer.Option(10, "--page-size", help="Number of results per page"),
+     max_related: int = typer.Option(10, "--max-related", help="Maximum related items to return"),
++    relation_type: Annotated[
++        Optional[List[str]],
++        typer.Option(
++            "--relation-type",
++            help="Only follow relations of this type (repeatable, e.g. --relation-type depends_on)",
++        ),
++    ] = None,
++    exclude_relation_type: Annotated[
++        Optional[List[str]],
++        typer.Option(
++            "--exclude-relation-type",
++            help="Skip relations of this type (repeatable; links_to drops prose mentions)",
++        ),
++    ] = None,
++    direction: str = typer.Option(
++        "both", "--direction", help="Relation edges to follow: outgoing, incoming, or both"
++    ),
+     json_output: bool = typer.Option(
+         False, "--json", help="Output raw JSON instead of formatted display"
+     ),
+@@ -1015,9 +1032,17 @@ def build_context(
+     bm tool build-context specs/search --depth 2 --timeframe 30d
+     bm tool build-context memory://specs/search --plain
+     bm tool build-context memory://specs/search --json
++    bm tool build-context specs/search --exclude-relation-type links_to
++    bm tool build-context specs/search --direction incoming
+     """
+     # Deferred: loading the MCP tool stack at module import slows CLI startup (#886).
+     from basic_memory.mcp.tools import build_context as mcp_build_context
++    from basic_memory.schemas.memory import RELATION_DIRECTIONS, RelationDirection
++
++    if direction not in RELATION_DIRECTIONS:
++        raise typer.BadParameter(
++            f"must be one of {', '.join(RELATION_DIRECTIONS)}", param_hint="--direction"
++        )
+ 
+     try:
+         validate_routing_flags(local, cloud)
+@@ -1036,6 +1061,9 @@ def build_context(
+                     max_related=max_related,
+                     output_format="json",
+                     compact=compact,
++                    relation_types=relation_type,
++                    exclude_relation_types=exclude_relation_type,
++                    direction=cast(RelationDirection, direction),
+                 )
+             )
+ 
+diff --git a/src/basic_memory/man/man3/build-context(3).md b/src/basic_memory/man/man3/build-context(3).md
+index 3f17a61..0a5895c 100644
+--- a/src/basic_memory/man/man3/build-context(3).md
++++ b/src/basic_memory/man/man3/build-context(3).md
+@@ -22,14 +22,16 @@ MCP:
+ ```
+ build_context(url, project=None, project_id=None, depth=1, timeframe="7d",
+               page=1, page_size=10, max_related=10, output_format="json",
+-              compact=False)
++              compact=False, relation_types=None,
++              exclude_relation_types=None, direction="both")
+ ```
+ 
+ CLI:
+ 
+ ```
+ bm tool build-context URL [--project NAME] [--depth N] [--timeframe SPEC]
+-                      [--max-related N]
++                      [--max-related N] [--relation-type TYPE]...
++                      [--exclude-relation-type TYPE]... [--direction DIR]
+ ```
+ 
+ ## DESCRIPTION
+@@ -52,6 +54,16 @@ become owning-file paths, which can be passed to `read_note`.
+ Read selected notes with `read_note`. The default response is unchanged.
+ This reduces MCP output, not API traversal work, and is not a fixed token limit.
+ 
++Relations carry the type their author wrote (`- depends_on [[Target]]`), and a
++wiki link in prose is an implicit `links_to`. By default every edge is followed
++and all of them compete for the same `max_related` budget. `relation_types`
++follows only the listed types, `exclude_relation_types` skips them (pass
++`["links_to"]` to keep just the explicitly typed relations), and `direction`
++picks the side of the edge: `outgoing` is what the note declares, `incoming`
++is what points at it. Each filter applies at every hop, so
++`relation_types=["depends_on"]` with `depth=2` returns transitive dependencies
++and nothing else. Type labels match exactly as written in the note.
++
+ ## PARAMETERS
+ 
+ - **url** (string, required) — memory:// URI pointing to discussion content (e.g. memory://specs/search), or a bare permalink path.
+@@ -64,6 +76,9 @@ This reduces MCP output, not API traversal work, and is not a fixed token limit.
+ - **max_related** (integer, optional, default: 10) — Maximum total related results to return (default: 10, maximum: 100)
+ - **output_format** (string, optional, default: "json") — Response format - "json" for structured JSON dict, "text" for compact markdown text
+ - **compact** (boolean, optional, default: False) — Omit note and observation bodies for graph discovery. Preserve identifiers, relation targets and pagination; use read_note for selected content. This reduces response size, not traversal work or a guaranteed token budget.
++- **relation_types** (array | null, optional, default: None) — Only follow relations with these types.
++- **exclude_relation_types** (array | null, optional, default: None) — Skip relations with these types (e.g. ["links_to"]).
++- **direction** (string, optional, default: "both") — Which relation edges to follow from each reached note: 'outgoing' (relations the note declares), 'incoming' (notes that point at it), or 'both' (default).
+ 
+ ## MCP USAGE
+ 
+@@ -80,6 +95,8 @@ build_context("man3/write-note-3", project="manual", depth=1,
+ 
+ - [gotcha] Default output_format is json here, unlike most sibling tools that default to text #output
+ - [gotcha] depth is measured in graph steps where one hop consumes two levels (relation + entity) — depth=1 returns direct neighbors only #traversal
++- [gotcha] relation filters match the type label exactly as authored (`depends_on` is not `depends-on`); a type nobody wrote returns the primary note with an empty related list #traversal
++- [pattern] exclude_relation_types=["links_to"] is the cheap way to drop prose mentions and keep the graph an author typed on purpose; direction="incoming" answers "what points here?" #traversal
+ - [pattern] Capture memory:// URLs in conversation summaries and handoffs; build_context on that URL is the cheapest way to restore working state #workflow
+ 
+ ## SEE ALSO
+diff --git a/src/basic_memory/mcp/clients/memory.py b/src/basic_memory/mcp/clients/memory.py
+index 1f53fa9..ac86398 100644
+--- a/src/basic_memory/mcp/clients/memory.py
++++ b/src/basic_memory/mcp/clients/memory.py
+@@ -16,6 +16,7 @@ from basic_memory.schemas.memory import (
+     DEFAULT_CONTEXT_PAGE_SIZE,
+     DEFAULT_CONTEXT_RELATED_RESULTS,
+     GraphContext,
++    RelationDirection,
+ )
+ 
+ 
+@@ -53,6 +54,9 @@ class MemoryClient:
+         page: int = 1,
+         page_size: int = DEFAULT_CONTEXT_PAGE_SIZE,
+         max_related: int = DEFAULT_CONTEXT_RELATED_RESULTS,
++        relation_types: Optional[list[str]] = None,
++        exclude_relation_types: Optional[list[str]] = None,
++        direction: RelationDirection = "both",
+     ) -> GraphContext:
+         """Build context from a memory path.
+ 
+@@ -63,6 +67,9 @@ class MemoryClient:
+             page: Page number (1-indexed)
+             page_size: Primary results per page
+             max_related: Maximum total related items across the page
++            relation_types: Only follow relations with these types
++            exclude_relation_types: Skip relations with these types
++            direction: Follow "outgoing", "incoming", or "both" relation edges
+ 
+         Returns:
+             GraphContext with hierarchical results
+@@ -80,6 +87,13 @@ class MemoryClient:
+         }
+         if timeframe:
+             params["timeframe"] = timeframe
++        # httpx repeats a list-valued key, which FastAPI reads as list[str].
++        if relation_types:
++            params["relation_types"] = list(relation_types)
++        if exclude_relation_types:
++            params["exclude_relation_types"] = list(exclude_relation_types)
++        if direction != "both":
++            params["direction"] = direction
+ 
+         with logfire.span(
+             "mcp.client.memory.build_context",
+diff --git a/src/basic_memory/mcp/tools/build_context.py b/src/basic_memory/mcp/tools/build_context.py
+index 45db3a2..544ffaa 100644
+--- a/src/basic_memory/mcp/tools/build_context.py
++++ b/src/basic_memory/mcp/tools/build_context.py
+@@ -5,7 +5,7 @@ from typing import Any, Annotated, Optional, Literal
+ import logfire
+ from loguru import logger
+ from fastmcp import Context
+-from pydantic import AliasChoices, Field
++from pydantic import AliasChoices, BeforeValidator, Field
+ 
+ from basic_memory.config import ConfigManager
+ from basic_memory.mcp.project_context import (
+@@ -25,8 +25,10 @@ from basic_memory.schemas.memory import (
+     MAX_CONTEXT_RELATED_RESULTS,
+     MemoryUrl,
+     ObservationSummary,
++    RelationDirection,
+     RelationSummary,
+ )
++from basic_memory.utils import parse_str_list
+ 
+ 
+ def _compact_observation(observation: ObservationSummary) -> ObservationSummary:
+@@ -172,6 +174,12 @@ def _format_context_markdown(graph: GraphContext, project: str, *, compact: bool
+     - "json" (default): Structured JSON with internal fields excluded
+     - "text": Compact markdown text for LLM consumption
+ 
++    Relation filters (which edges the traversal follows):
++    - relation_types: only follow these relation types, e.g. ["depends_on", "caused_by"]
++    - exclude_relation_types: skip these types, e.g. ["links_to"] drops prose mentions
++    - direction: "outgoing" (this note's own relations), "incoming" (notes pointing
++      here), or "both" (default)
++
+     Queries the Basic Memory knowledge base API — see
+     https://docs.basicmemory.com/concepts/memory-urls
+     """,
+@@ -226,6 +234,30 @@ async def build_context(
+         "relation targets and pagination; use read_note for selected content. "
+         "This reduces response size, not traversal work or a guaranteed token budget.",
+     ] = False,
++    relation_types: Annotated[
++        list[str] | None,
++        # "depends_on,caused_by" must split into two labels, matching search_notes.
++        BeforeValidator(parse_str_list),
++        Field(default=None, validation_alias=AliasChoices("relation_types", "relation_type")),
++        "Only follow relations of these types (as written in notes, e.g. 'depends_on'). "
++        "Accepts a list, a comma-separated string, or a JSON-array string. "
++        "Applies at every hop of the traversal; the primary note is always returned.",
++    ] = None,
++    exclude_relation_types: Annotated[
++        list[str] | None,
++        BeforeValidator(parse_str_list),
++        Field(
++            default=None,
++            validation_alias=AliasChoices("exclude_relation_types", "exclude_relation_type"),
++        ),
++        "Skip relations of these types. Pass 'links_to' to ignore implicit prose "
++        "mentions and keep only explicitly typed relations. Same input forms as relation_types.",
++    ] = None,
++    direction: Annotated[
++        RelationDirection,
++        "Which relation edges to follow from each reached note: 'outgoing' (relations the "
++        "note declares), 'incoming' (notes that point at it), or 'both' (default).",
++    ] = "both",
+ ) -> dict[str, Any] | str:
+     """Get context needed to continue a discussion within a specific project.
+ 
+@@ -255,6 +287,9 @@ async def build_context(
+             "text" for compact markdown text
+         context: Optional FastMCP context for performance caching.
+         compact: Omit note and observation bodies while retaining navigation summaries.
++        relation_types: Only follow relations with these types.
++        exclude_relation_types: Skip relations with these types (e.g. ["links_to"]).
++        direction: Follow "outgoing", "incoming", or "both" relation edges.
+ 
+     Returns:
+         dict (output_format="json"): Structured JSON with internal fields excluded
+@@ -270,6 +305,13 @@ async def build_context(
+         # Get text output for compact context
+         build_context("research", "memory://specs/search", output_format="text")
+ 
++        # Follow only typed dependencies, ignoring prose mentions
++        build_context("work-docs", "memory://decisions/adr-7", depth=2,
++                      relation_types=["depends_on", "caused_by"])
++
++        # Find which notes point at this one
++        build_context("work-docs", "memory://specs/auth", direction="incoming")
++
+     Raises:
+         ToolError: If project doesn't exist or depth parameter is invalid
+     """
+@@ -303,6 +345,14 @@ async def build_context(
+             "memory:// links for more context."
+         )
+ 
++    # Trigger: the tool is called as a plain function (tests, CLI) with a comma
++    #          string, so the BeforeValidator on the signature never ran.
++    # Why: a bare str would reach MemoryClient, where list("links_to") sends one
++    #      query parameter per character and the filter silently matches nothing.
++    # Outcome: the same normalization as the schema path, idempotent for lists.
++    relation_types = parse_str_list(relation_types) or None
++    exclude_relation_types = parse_str_list(exclude_relation_types) or None
++
+     # Detect project from memory URL prefix before routing.
+     # project_id routes by external UUID, so it bypasses URL discovery entirely.
+     if project is None and project_id is None:
+@@ -339,6 +389,9 @@ async def build_context(
+         page_size=page_size,
+         max_related=max_related,
+         output_format=output_format,
++        relation_types=relation_types,
++        exclude_relation_types=exclude_relation_types,
++        direction=direction,
+         is_memory_url=str(url).startswith("memory://"),
+     ):
+         async with get_project_client(project, context=context, project_id=project_id) as (
+@@ -347,7 +400,9 @@ async def build_context(
+         ):
+             logger.info(
+                 f"MCP tool call tool=build_context project={active_project.name} "
+-                f"url={url} depth={depth} timeframe={timeframe} output_format={output_format}"
++                f"url={url} depth={depth} timeframe={timeframe} output_format={output_format} "
++                f"relation_types={relation_types} exclude_relation_types={exclude_relation_types} "
++                f"direction={direction}"
+             )
+ 
+             # Resolve memory:// identifier with project-prefix awareness
+@@ -370,6 +425,9 @@ async def build_context(
+                 page=page,
+                 page_size=page_size,
+                 max_related=max_related,
++                relation_types=relation_types,
++                exclude_relation_types=exclude_relation_types,
++                direction=direction,
+             )
+ 
+             logger.info(
+diff --git a/src/basic_memory/schemas/memory.py b/src/basic_memory/schemas/memory.py
+index e003a10..8835ed7 100644
+--- a/src/basic_memory/schemas/memory.py
++++ b/src/basic_memory/schemas/memory.py
+@@ -14,6 +14,10 @@ MAX_CONTEXT_PAGE_SIZE = 50
+ DEFAULT_CONTEXT_RELATED_RESULTS = 10
+ MAX_CONTEXT_RELATED_RESULTS = 100
+ 
++# Which relation edges a context traversal follows from each reached entity.
++RelationDirection = Literal["outgoing", "incoming", "both"]
++RELATION_DIRECTIONS: tuple[str, ...] = ("outgoing", "incoming", "both")
++
+ 
+ def validate_memory_url_path(path: str) -> bool:
+     """Validate that a memory URL path is well-formed.
+diff --git a/src/basic_memory/services/context_service.py b/src/basic_memory/services/context_service.py
+index 7017299..8e94001 100644
+--- a/src/basic_memory/services/context_service.py
++++ b/src/basic_memory/services/context_service.py
+@@ -8,7 +8,7 @@ from typing import Any, List, Optional, Tuple, TYPE_CHECKING
+ 
+ 
+ from loguru import logger
+-from sqlalchemy import text
++from sqlalchemy import bindparam, text
+ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+ 
+ import logfire
+@@ -17,7 +17,12 @@ from basic_memory.repository.entity_repository import EntityRepository
+ from basic_memory.repository.observation_repository import ObservationRepository
+ from basic_memory.repository.postgres_search_repository import PostgresSearchRepository
+ from basic_memory.repository.search_repository import SearchRepository, SearchIndexRow
+-from basic_memory.schemas.memory import MemoryUrl, memory_url_path
++from basic_memory.schemas.memory import (
++    RELATION_DIRECTIONS,
++    MemoryUrl,
++    RelationDirection,
++    memory_url_path,
++)
+ from basic_memory.schemas.search import SearchItemType
+ from basic_memory.utils import generate_permalink
+ from basic_memory.workspace_context import workspace_slug_for_canonical_permalinks
+@@ -26,6 +31,22 @@ if TYPE_CHECKING:
+     from basic_memory.services.link_resolver import LinkResolver
+ 
+ 
++def normalize_relation_types(values: Optional[List[str]]) -> Optional[List[str]]:
++    """Return a de-duplicated list of relation type labels, or None when empty.
++
++    Labels match the `relation.relation_type` column exactly as authored
++    (`depends_on`, `links_to`, ...); only surrounding whitespace is dropped.
++    """
++    if not values:
++        return None
++    seen: dict[str, None] = {}
++    for value in values:
++        label = value.strip() if isinstance(value, str) else ""
++        if label:
++            seen.setdefault(label, None)
++    return list(seen) or None
++
++
+ @dataclass
+ class ContextResultRow:
+     type: str
+@@ -117,10 +138,17 @@ class ContextService:
+         offset=0,
+         max_related: int = 10,
+         include_observations: bool = True,
++        relation_types: Optional[List[str]] = None,
++        exclude_relation_types: Optional[List[str]] = None,
++        direction: RelationDirection = "both",
+     ) -> ContextResult:
+-        """Build rich context from a memory:// URI."""
++        """Build rich context from a memory:// URI.
++
++        `relation_types`, `exclude_relation_types` and `direction` narrow which
++        relation edges the traversal follows; the primary results are unaffected.
++        """
+         logger.debug(
+-            f"Building context for URI: '{memory_url}' depth: '{depth}' since: '{since}' limit: '{limit}' offset: '{offset}'  max_related: '{max_related}'"
++            f"Building context for URI: '{memory_url}' depth: '{depth}' since: '{since}' limit: '{limit}' offset: '{offset}'  max_related: '{max_related}' relation_types: '{relation_types}' exclude_relation_types: '{exclude_relation_types}' direction: '{direction}'"
+         )
+ 
+         with logfire.span(
+@@ -226,7 +254,13 @@ class ContextService:
+                 phase="find_related",
+             ):
+                 related = await self.find_related(
+-                    type_id_pairs, max_depth=depth, since=since, max_results=max_related
++                    type_id_pairs,
++                    max_depth=depth,
++                    since=since,
++                    max_results=max_related,
++                    relation_types=relation_types,
++                    exclude_relation_types=exclude_relation_types,
++                    direction=direction,
+                 )
+             logger.debug(f"Found {len(related)} related results")
+ 
+@@ -317,6 +351,9 @@ class ContextService:
+         max_depth: int = 1,
+         since: Optional[datetime] = None,
+         max_results: int = 10,
++        relation_types: Optional[List[str]] = None,
++        exclude_relation_types: Optional[List[str]] = None,
++        direction: RelationDirection = "both",
+     ) -> List[ContextResultRow]:
+         """Find items connected through relations.
+ 
+@@ -324,6 +361,16 @@ class ContextService:
+         - Connected entities
+         - Relations that connect them
+ 
++        Edge filters:
++        - relation_types: follow only edges whose relation_type is in the list
++        - exclude_relation_types: skip edges whose relation_type is in the list
++          (e.g. `links_to` to ignore prose mentions)
++        - direction: "outgoing" follows edges from the current entity,
++          "incoming" follows edges pointing at it, "both" (default) follows either
++
++        Every filter applies at each hop, so a depth-2 traversal restricted to
++        `depends_on` only reaches transitive dependencies.
++
+         Note on depth:
+         Each traversal step requires two depth levels - one to find the relation,
+         and another to follow that relation to an entity. So a max_depth of 4 allows
+@@ -356,6 +403,36 @@ class ContextService:
+             "project_id": self.search_repository.project_id,
+         }
+ 
++        # Trigger: a caller narrows traversal to some relation types or one direction.
++        # Why: every edge, including implicit prose `links_to`, otherwise competes for
++        #      the same max_results budget, so the semantic edges a note author typed
++        #      (`caused_by`, `depends_on`, ...) are crowded out by mentions.
++        # Outcome: the recursive step joins only matching edges; primary lookup and
++        #      pagination are untouched, and no filter means the existing traversal.
++        if direction not in RELATION_DIRECTIONS:
++            raise ValueError(
++                f"direction must be one of {', '.join(RELATION_DIRECTIONS)}, got {direction!r}"
++            )
++        relation_edge_filter = {
++            "outgoing": "r.from_id = eg.id",
++            "incoming": "r.to_id = eg.id",
++            "both": "(r.from_id = eg.id OR r.to_id = eg.id)",
++        }[direction]
++
++        include_types = normalize_relation_types(relation_types)
++        exclude_types = normalize_relation_types(exclude_relation_types)
++        relation_type_filters: list[str] = []
++        expanding_params: list[str] = []
++        if include_types:
++            params["relation_types"] = include_types
++            expanding_params.append("relation_types")
++            relation_type_filters.append("AND r.relation_type IN :relation_types")
++        if exclude_types:
++            params["exclude_relation_types"] = exclude_types
++            expanding_params.append("exclude_relation_types")
++            relation_type_filters.append("AND r.relation_type NOT IN :exclude_relation_types")
++        relation_type_filter = "\n                ".join(relation_type_filters)
++
+         # Build date and timeframe filters conditionally based on since parameter
+         if since:
+             # SQLite accepts ISO strings, but Postgres/asyncpg requires datetime objects
+@@ -404,6 +481,8 @@ class ContextService:
+                 relation_date_filter,
+                 relation_project_filter,
+                 timeframe_condition,
++                relation_edge_filter,
++                relation_type_filter,
+             )
+         else:
+             # SQLite needs VALUES clause for exclusion (not needed for Postgres)
+@@ -417,6 +496,15 @@ class ContextService:
+                 relation_project_filter,
+                 timeframe_condition,
+                 values,
++                relation_edge_filter,
++                relation_type_filter,
++            )
++
++        if expanding_params:
++            # IN (:list) needs an expanding bind so each backend renders the
++            # placeholders it accepts rather than a single scalar parameter.
++            query = query.bindparams(
++                *[bindparam(name, expanding=True) for name in expanding_params]
+             )
+ 
+         result = await self.search_repository.execute_query(query, params=params)
+@@ -453,6 +541,8 @@ class ContextService:
+         relation_date_filter: str,
+         relation_project_filter: str,
+         timeframe_condition: str,
++        relation_edge_filter: str = "(r.from_id = eg.id OR r.to_id = eg.id)",
++        relation_type_filter: str = "",
+     ):
+         """Build Postgres-specific CTE query using LATERAL joins."""
+         return text(f"""
+@@ -549,8 +639,9 @@ class ContextService:
+             CROSS JOIN LATERAL (VALUES (1), (2)) AS steps(step_type)
+             JOIN relation r ON (
+                 eg.type = 'entity' AND
+-                (r.from_id = eg.id OR r.to_id = eg.id) AND
++                {relation_edge_filter} AND
+                 r.project_id = eg.project_id
++                {relation_type_filter}
+             )
+             JOIN entity e_from ON (
+                 r.from_id = e_from.id
+@@ -612,6 +703,8 @@ class ContextService:
+         relation_project_filter: str,
+         timeframe_condition: str,
+         values: str,
++        relation_edge_filter: str = "(r.from_id = eg.id OR r.to_id = eg.id)",
++        relation_type_filter: str = "",
+     ):
+         """Build SQLite-specific CTE query using multiple UNION ALL branches."""
+         return text(f"""
+@@ -668,8 +761,9 @@ class ContextService:
+             FROM entity_graph eg
+             JOIN relation r ON (
+                 eg.type = 'entity' AND
+-                (r.from_id = eg.id OR r.to_id = eg.id) AND
++                {relation_edge_filter} AND
+                 r.project_id = eg.project_id
++                {relation_type_filter}
+             )
+             JOIN entity e_from ON (
+                 r.from_id = e_from.id
+diff --git a/tests/api/v2/test_memory_router.py b/tests/api/v2/test_memory_router.py
+index 8537c76..b52a123 100644
+--- a/tests/api/v2/test_memory_router.py
++++ b/tests/api/v2/test_memory_router.py
+@@ -1,5 +1,7 @@
+ """Tests for v2 memory router endpoints."""
+ 
++from typing import Any
++
+ import pytest
+ from httpx import AsyncClient
+ from pathlib import Path
+@@ -367,3 +369,69 @@ async def test_v2_memory_endpoints_use_project_id_not_name(
+ 
+     # FastAPI path validation should reject non-integer project_id
+     assert response.status_code in [404, 422]
++
++
++@pytest.mark.asyncio
++async def test_get_memory_context_relation_filters(
++    client: AsyncClient, test_project: Project, v2_project_url: str, test_graph
++):
++    """Relation filters are query parameters on the context endpoint."""
++    uri = f"{test_project.name}/test/root"
++
++    def related(data: dict[str, Any]) -> tuple[set[str], set[str]]:
++        items = data["results"][0]["related_results"]
++        return (
++            {i["relation_type"] for i in items if i["type"] == "relation"},
++            {i["title"] for i in items if i["type"] == "entity"},
++        )
++
++    response = await client.get(
++        f"{v2_project_url}/memory/{uri}",
++        params={"depth": 3, "max_related": 100, "relation_types": ["connects_to"]},
++    )
++    assert response.status_code == 200
++    assert related(response.json()) == ({"connects_to"}, {"Connected Entity 1"})
++
++    response = await client.get(
++        f"{v2_project_url}/memory/{uri}",
++        params={"depth": 3, "max_related": 100, "exclude_relation_types": ["connected_to"]},
++    )
++    assert response.status_code == 200
++    assert related(response.json()) == ({"connects_to"}, {"Connected Entity 1"})
++
++    response = await client.get(
++        f"{v2_project_url}/memory/{uri}", params={"exclude_relation_types": ["connects_to"]}
++    )
++    assert response.status_code == 200
++    data = response.json()
++    assert data["results"][0]["primary_result"]["title"] == "Root"
++    assert data["results"][0]["related_results"] == []
++
++    response = await client.get(
++        f"{v2_project_url}/memory/{test_project.name}/test/connected-entity-1",
++        params={"direction": "incoming"},
++    )
++    assert response.status_code == 200
++    assert related(response.json()) == ({"connects_to"}, {"Root"})
++
++    response = await client.get(f"{v2_project_url}/memory/{uri}", params={"direction": "sideways"})
++    assert response.status_code == 422
++
++
++@pytest.mark.asyncio
++async def test_get_recent_context_accepts_relation_filters(
++    client: AsyncClient, v2_project_url: str, test_graph
++):
++    response = await client.get(
++        f"{v2_project_url}/memory/recent",
++        params={"type": ["entity"], "relation_types": ["connects_to"], "direction": "outgoing"},
++    )
++    assert response.status_code == 200
++    data = response.json()
++    relation_types = {
++        item["relation_type"]
++        for result in data["results"]
++        for item in result["related_results"]
++        if item["type"] == "relation"
++    }
++    assert relation_types <= {"connects_to"}
+diff --git a/tests/cli/test_cli_tool_json_output.py b/tests/cli/test_cli_tool_json_output.py
+index 6231620..a3cd7e6 100644
+--- a/tests/cli/test_cli_tool_json_output.py
++++ b/tests/cli/test_cli_tool_json_output.py
+@@ -550,6 +550,68 @@ def test_build_context_with_options(mock_build_ctx):
+     assert kwargs["max_related"] == 5
+ 
+ 
++@patch(
++    "basic_memory.mcp.tools.build_context",
++    new_callable=AsyncMock,
++    return_value=BUILD_CONTEXT_RESULT,
++)
++def test_build_context_relation_filter_options(mock_build_ctx):
++    """build-context passes repeatable relation filters and direction through."""
++    result = runner.invoke(
++        cli_app,
++        [
++            "tool",
++            "build-context",
++            "memory://test/topic",
++            "--relation-type",
++            "depends_on",
++            "--relation-type",
++            "caused_by",
++            "--exclude-relation-type",
++            "links_to",
++            "--direction",
++            "outgoing",
++        ],
++    )
++
++    assert result.exit_code == 0, f"CLI failed: {result.output}"
++    kwargs = mock_build_ctx.call_args.kwargs
++    assert kwargs["relation_types"] == ["depends_on", "caused_by"]
++    assert kwargs["exclude_relation_types"] == ["links_to"]
++    assert kwargs["direction"] == "outgoing"
++
++
++@patch(
++    "basic_memory.mcp.tools.build_context",
++    new_callable=AsyncMock,
++    return_value=BUILD_CONTEXT_RESULT,
++)
++def test_build_context_defaults_leave_relation_filters_unset(mock_build_ctx):
++    result = runner.invoke(cli_app, ["tool", "build-context", "memory://test/topic"])
++
++    assert result.exit_code == 0, f"CLI failed: {result.output}"
++    kwargs = mock_build_ctx.call_args.kwargs
++    assert kwargs["relation_types"] is None
++    assert kwargs["exclude_relation_types"] is None
++    assert kwargs["direction"] == "both"
++
++
++@patch(
++    "basic_memory.mcp.tools.build_context",
++    new_callable=AsyncMock,
++    return_value=BUILD_CONTEXT_RESULT,
++)
++def test_build_context_rejects_unknown_direction(mock_build_ctx):
++    result = runner.invoke(
++        cli_app, ["tool", "build-context", "memory://test/topic", "--direction", "sideways"]
++    )
++
++    assert result.exit_code != 0
++    assert "--direction" in result.output
++    assert "outgoing, incoming, both" in result.output
++    mock_build_ctx.assert_not_called()
++
++
+ # --- recent-activity ---
+ 
+ 
+diff --git a/tests/mcp/test_tool_build_context.py b/tests/mcp/test_tool_build_context.py
+index 7276867..5e1d408 100644
+--- a/tests/mcp/test_tool_build_context.py
++++ b/tests/mcp/test_tool_build_context.py
+@@ -1,5 +1,7 @@
+ """Tests for discussion context MCP tool."""
+ 
++from typing import Any
++
+ import pytest
+ 
+ from fastmcp.exceptions import ToolError
+@@ -304,3 +306,139 @@ def test_format_entity_block_renders_unresolved_relations_by_name():
+     assert "- see_also [[edit-note(3)]]" in block
+     assert "- see_also [[bm-note(5)]]" in block
+     assert "[[None]]" not in block
++
++
++@pytest.mark.asyncio
++async def test_build_context_relation_type_filters(client, test_project):
++    """Typed relations and prose mentions can be told apart at traversal time."""
++    await write_note(
++        project=test_project.name,
++        title="Outage Cause",
++        directory="filters",
++        content="# Outage Cause\n\nThe connection pool was exhausted.",
++    )
++    await write_note(
++        project=test_project.name,
++        title="Runbook Mention",
++        directory="filters",
++        content="# Runbook Mention\n\nJust a page that gets mentioned in passing.",
++    )
++    await write_note(
++        project=test_project.name,
++        title="Outage Postmortem",
++        directory="filters",
++        content=(
++            "# Outage Postmortem\n\n"
++            "See [[Runbook Mention]] for the on-call steps.\n\n"
++            "## Relations\n"
++            "- caused_by [[Outage Cause]]\n"
++        ),
++    )
++
++    def relation_types(result: Any) -> set[str]:
++        return {
++            item["relation_type"]
++            for item in result["results"][0]["related_results"]
++            if item["type"] == "relation"
++        }
++
++    def related_titles(result: Any) -> set[str]:
++        return {
++            item["title"]
++            for item in result["results"][0]["related_results"]
++            if item["type"] == "entity"
++        }
++
++    # Plain-function callers (CLI, tests) can hand over a comma string; the
++    # schema's BeforeValidator does not run for them, so the body normalizes.
++    comma_string: Any = "links_to"
++    unknown_type: Any = "no_such_type"
++
++    # Unfiltered: both the typed edge and the implicit prose mention are followed
++    everything = await build_context(
++        project=test_project.name, url="memory://filters/outage-postmortem"
++    )
++    assert relation_types(everything) == {"caused_by", "links_to"}
++    assert related_titles(everything) == {"Outage Cause", "Runbook Mention"}
++
++    # exclude_relation_types drops the prose mention; a comma string is accepted
++    typed_only = await build_context(
++        project=test_project.name,
++        url="memory://filters/outage-postmortem",
++        exclude_relation_types=comma_string,
++    )
++    assert relation_types(typed_only) == {"caused_by"}
++    assert related_titles(typed_only) == {"Outage Cause"}
++
++    # relation_types keeps only the listed edges
++    causes = await build_context(
++        project=test_project.name,
++        url="memory://filters/outage-postmortem",
++        relation_types=["caused_by"],
++    )
++    assert relation_types(causes) == {"caused_by"}
++    assert related_titles(causes) == {"Outage Cause"}
++
++    # The primary note itself is never filtered away
++    nothing = await build_context(
++        project=test_project.name,
++        url="memory://filters/outage-postmortem",
++        relation_types=unknown_type,
++    )
++    assert isinstance(nothing, dict)
++    assert nothing["results"][0]["primary_result"]["title"] == "Outage Postmortem"
++    assert nothing["results"][0]["related_results"] == []
++    assert nothing["metadata"]["related_count"] == 0
++
++
++@pytest.mark.asyncio
++async def test_build_context_direction(client, test_project):
++    """direction="incoming" answers "what points at this note?"."""
++    await write_note(
++        project=test_project.name,
++        title="Session Store",
++        directory="direction",
++        content="# Session Store\n\nStorage for sessions.",
++    )
++    await write_note(
++        project=test_project.name,
++        title="Auth Spec",
++        directory="direction",
++        content="# Auth Spec\n\n## Relations\n- depends_on [[Session Store]]\n",
++    )
++    await write_note(
++        project=test_project.name,
++        title="Login Flow",
++        directory="direction",
++        content="# Login Flow\n\n## Relations\n- implements [[Auth Spec]]\n",
++    )
++
++    def related_titles(result: Any) -> set[str]:
++        return {
++            item["title"]
++            for item in result["results"][0]["related_results"]
++            if item["type"] == "entity"
++        }
++
++    incoming = await build_context(
++        project=test_project.name, url="memory://direction/auth-spec", direction="incoming"
++    )
++    assert related_titles(incoming) == {"Login Flow"}
++
++    outgoing = await build_context(
++        project=test_project.name, url="memory://direction/auth-spec", direction="outgoing"
++    )
++    assert related_titles(outgoing) == {"Session Store"}
++
++    both = await build_context(
++        project=test_project.name, url="memory://direction/auth-spec", direction="both"
++    )
++    assert related_titles(both) == {"Login Flow", "Session Store"}
++
++    bad_direction: Any = "sideways"
++    with pytest.raises(ToolError):
++        await build_context(
++            project=test_project.name,
++            url="memory://direction/auth-spec",
++            direction=bad_direction,
++        )
+diff --git a/tests/services/test_context_service.py b/tests/services/test_context_service.py
+index 48513ac..6f37d68 100644
+--- a/tests/services/test_context_service.py
++++ b/tests/services/test_context_service.py
+@@ -1,6 +1,7 @@
+ """Tests for context service."""
+ 
+ from datetime import datetime, timedelta, UTC
++from typing import Any
+ 
+ import pytest
+ import pytest_asyncio
+@@ -769,3 +770,117 @@ async def test_pattern_search_falls_back_for_legacy_unqualified_rows(context_ser
+     permalinks = {result.primary_result.permalink for result in context.results}
+     assert permalinks, "fallback did not match legacy rows"
+     assert all(p and p.startswith("test-project/test/") for p in permalinks), permalinks
++
++
++def test_normalize_relation_types_drops_blank_and_duplicate_labels():
++    from basic_memory.services.context_service import normalize_relation_types
++
++    assert normalize_relation_types(None) is None
++    assert normalize_relation_types([]) is None
++    assert normalize_relation_types(["  ", ""]) is None
++    assert normalize_relation_types([" depends_on ", "depends_on", "links_to"]) == [
++        "depends_on",
++        "links_to",
++    ]
++
++
++@pytest.mark.asyncio
++async def test_find_related_follows_only_listed_relation_types(context_service, test_graph):
++    """relation_types restricts every hop, so the chain stops where the type changes.
++
++    Root -connects_to-> Connected 1 -connected_to-> Connected 2 -deep_connection-> Deep
++    """
++    type_id_pairs = [("entity", test_graph["root"].id)]
++
++    results = await context_service.find_related(
++        type_id_pairs, max_depth=3, max_results=100, relation_types=["connects_to"]
++    )
++
++    relation_types = {r.relation_type for r in results if r.type == "relation"}
++    entity_ids = {r.id for r in results if r.type == "entity"}
++    assert relation_types == {"connects_to"}
++    assert entity_ids == {test_graph["connected1"].id}
++
++
++@pytest.mark.asyncio
++async def test_find_related_excludes_listed_relation_types(context_service, test_graph):
++    """exclude_relation_types drops matching edges and everything only reachable through them."""
++    type_id_pairs = [("entity", test_graph["root"].id)]
++
++    unfiltered = await context_service.find_related(type_id_pairs, max_depth=3, max_results=100)
++    assert unfiltered
++
++    results = await context_service.find_related(
++        type_id_pairs, max_depth=3, max_results=100, exclude_relation_types=["connects_to"]
++    )
++    assert results == []
++
++    # Excluding a type that only appears deeper keeps the first hop intact
++    results = await context_service.find_related(
++        type_id_pairs, max_depth=3, max_results=100, exclude_relation_types=["connected_to"]
++    )
++    entity_ids = {r.id for r in results if r.type == "entity"}
++    assert entity_ids == {test_graph["connected1"].id}
++
++
++@pytest.mark.asyncio
++async def test_find_related_direction_outgoing_and_incoming(context_service, test_graph):
++    """direction picks the side of the edge to follow from the seed entity."""
++    type_id_pairs = [("entity", test_graph["connected1"].id)]
++
++    outgoing = await context_service.find_related(
++        type_id_pairs, max_depth=1, max_results=100, direction="outgoing"
++    )
++    assert {r.id for r in outgoing if r.type == "entity"} == {test_graph["connected2"].id}
++    assert {r.relation_type for r in outgoing if r.type == "relation"} == {"connected_to"}
++
++    incoming = await context_service.find_related(
++        type_id_pairs, max_depth=1, max_results=100, direction="incoming"
++    )
++    assert {r.id for r in incoming if r.type == "entity"} == {test_graph["root"].id}
++    assert {r.relation_type for r in incoming if r.type == "relation"} == {"connects_to"}
++
++    both = await context_service.find_related(
++        type_id_pairs, max_depth=1, max_results=100, direction="both"
++    )
++    assert {r.id for r in both if r.type == "entity"} == {
++        test_graph["root"].id,
++        test_graph["connected2"].id,
++    }
++
++
++@pytest.mark.asyncio
++async def test_find_related_rejects_unknown_direction(context_service, test_graph):
++    bad_direction: Any = "sideways"
++    with pytest.raises(ValueError, match="direction must be one of"):
++        await context_service.find_related(
++            [("entity", test_graph["root"].id)],
++            max_depth=1,
++            direction=bad_direction,
++        )
++
++
++@pytest.mark.asyncio
++async def test_build_context_applies_relation_filters(context_service, test_graph):
++    """Filters narrow related_results without touching the primary result."""
++    url = memory_url.validate_strings("memory://test-project/test/root")
++
++    context_result = await context_service.build_context(
++        url, depth=3, max_related=100, relation_types=["connects_to"]
++    )
++    assert context_result.metadata.primary_count == 1
++    item = context_result.results[0]
++    assert item.primary_result.id == test_graph["root"].id
++    assert {r.relation_type for r in item.related_results if r.type == "relation"} == {
++        "connects_to"
++    }
++    assert {r.id for r in item.related_results if r.type == "entity"} == {
++        test_graph["connected1"].id
++    }
++
++    context_result = await context_service.build_context(
++        url, depth=1, exclude_relation_types=["connects_to"]
++    )
++    assert context_result.metadata.primary_count == 1
++    assert context_result.metadata.related_count == 0
++    assert context_result.results[0].related_results == []
+-- 
+2.43.0
+
